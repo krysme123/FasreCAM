@@ -71,49 +71,104 @@ class BaseCAM(ABC):
 
 class FASRECAM(BaseCAM):
     @torch.no_grad()
-    def _logit(self, x):
-        out = self.model.fc(self.model.avgpool(x).flatten(1)).view(1, -1)
-        non_idx_logits = torch.cat([out[:, :self._idx], out[:, self._idx + 1:]], dim=1)
-        target_logit = out.gather(1, self._idx.view(-1, 1)).squeeze(1)
-        non_target_mean = torch.mean(non_idx_logits)
-        return target_logit, non_target_mean  # (B,)
+    def __init__(self, model, target_layer, patch_size=3):
+        super().__init__(model, target_layer)
+        self.patch_size = patch_size  # 扰动区域大小（默认3×3）
 
+    # 1. 批量计算logit
+    @torch.no_grad()
+    def _logit_batch(self, x):
+        """
+        x: (B,C,H,W) 批量特征图（B≥1）
+        return:
+            target_logit: (B,) 每个样本的目标类logit
+            non_target_mean: (B,) 每个样本的非目标类均值
+        """
+        B = x.shape[0]
+        # 批量池化+全连接
+        avg_pool = self.model.avgpool(x)  # (B,C,1,1)
+        flat = avg_pool.flatten(1)  # (B,C)
+        out = self.model.fc(flat)  # (B, num_classes)
+
+        # 批量处理非目标类logit
+        target_logit = []
+        non_target_mean = []
+        for b in range(B):
+            # 当前样本的目标类别
+            idx_b = self._idx[b].item()
+            # 非目标类logit
+            non_idx_logits = torch.cat([
+                out[b, :idx_b],
+                out[b, idx_b + 1:]
+            ], dim=0)
+            target_logit.append(out[b, idx_b])
+            non_target_mean.append(torch.mean(non_idx_logits))
+
+        return torch.stack(target_logit, dim=0), torch.stack(non_target_mean, dim=0)
+
+    # 2. 3×3区域置零扰动（核心，处理边界）
+    def _perturb_3x3_patch(self, fmap, b, h_center, w_center):
+        """
+        对第b个样本的(h_center, w_center)为中心的3×3区域置零
+        处理边界：边缘像素只扰动有效区域
+        """
+        H, W = fmap.shape[2], fmap.shape[3]
+        # 计算3×3区域的上下左右边界（避免越界）
+        h_start = max(0, h_center - self.patch_size // 2)
+        h_end = min(H, h_center + self.patch_size // 2 + 1)
+        w_start = max(0, w_center - self.patch_size // 2)
+        w_end = min(W, w_center + self.patch_size // 2 + 1)
+
+        # 3×3区域置零
+        fmap_perturbed = fmap.clone()
+        fmap_perturbed[b, :, h_start:h_end, w_start:w_end] = 0
+        return fmap_perturbed
+
+    # 3. 生成CAM
     def generate_cam(self, fmap, grad=None, score=None):
-        [batch, channel, height, width] = fmap.shape
-        hw = height * width
-        device = next(self.model.parameters()).device
-        score_temp = torch.zeros((batch, 1, height, width)).to(device)
-        weights_grad = grad.mean(dim=(2, 3), keepdim=True)  # (B,C,1,1)
+        B, C, H_f, W_f = fmap.shape  # B≥1（单样本B=1，批量B=32）
+        device = fmap.device
+        score_temp = torch.zeros((B, 1, H_f, W_f), device=device) 
+        weights_grad = grad.mean(dim=(2, 3), keepdim=True)  # (B,C,1,1) 
 
-        # 预计算原始非目标均值
-        _, non_target_original = self._logit(fmap)
+        target_original, non_target_original = self._logit_batch(fmap)
+        safe_non_target_original = non_target_original + torch.sign(non_target_original) * 1e-6
+        safe_score = score.squeeze(-1) + torch.sign(score.squeeze(-1)) * 1e-6  # (B,)
 
-        # 用于收集分布数据的列表
+        # 用于分布分析
         ratio1_list = []
         ratio2_list = []
 
-        for i in range(hw):
-            fmap_temp = fmap.clone()
-            fmap_temp[:, :, i // width, i % width] = 0
-            target_temp, non_target_temp = self._logit(fmap_temp)
+        # 遍历所有像素作为3×3中心（兼容单样本）
+        for b in range(B):  # 单样本时b=0
+            for h_center in range(H_f):
+                for w_center in range(W_f):
+                    # 3×3区域置零扰动
+                    fmap_perturbed = self._perturb_3x3_patch(fmap, b, h_center, w_center)
+                    # 计算扰动后logit
+                    target_temp, non_target_temp = self._logit_batch(fmap_perturbed)
+                    target_temp_b = target_temp[b]
+                    non_target_temp_b = non_target_temp[b]
 
-            ratio1 = (score - target_temp)
-            ratio2 = (non_target_original - non_target_temp)
+                    # 计算比率
+                    ratio1_b = (safe_score[b] - target_temp_b)
+                    ratio2_b = (safe_non_target_original[b] - non_target_temp_b)
+
+                    # 记录数据
+                    ratio1_list.append(np.atleast_1d(ratio1_b.detach().cpu().numpy()))
+                    ratio2_list.append(np.atleast_1d(ratio2_b.detach().cpu().numpy()))
+
+                    # 3×3区域权重赋值
+                    h_start = max(0, h_center - self.patch_size // 2)
+                    h_end = min(H_f, h_center + self.patch_size // 2 + 1)
+                    w_start = max(0, w_center - self.patch_size // 2)
+                    w_end = min(W_f, w_center + self.patch_size // 2 + 1)
+                    score_temp[b, 0, h_start:h_end, w_start:w_end] = torch.abs(ratio1_b * ratio2_b)
 
 
-            ratio1_np = ratio1.detach().cpu().numpy()
-            ratio1_list.append(np.atleast_1d(ratio1_np))  # 转为一维数组
-
-            ratio2_np = ratio2.detach().cpu().numpy()
-            ratio2_list.append(np.atleast_1d(ratio2_np))  # 转为一维数组
-
-            score_temp[:, 0, i // width, i % width] = torch.abs(ratio1 * ratio2)
-
-        # 生成CAM
-        cam = (weights_grad * (fmap * score_temp)).mean(1, keepdim=True)
+        # 生成热力图（兼容单样本）
+        cam = (weights_grad * (fmap * score_temp)).mean(1, keepdim=True)  # (B,1,H_f,W_f)
         cam = torch.relu(cam)
         return cam.detach()
-
-
 
 
