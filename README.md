@@ -17,7 +17,7 @@
 ## 📊 实验结果与可视化
 
 ![FASRECAM](/FASRECAM.png)
-*图：FasreCAM 与传统 CAM 方法在目标区域定位上的效果对比*
+*图：FasreCAM在目标区域定位上的效果*
 
 ## 📁 项目结构
 
