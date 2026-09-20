@@ -17,14 +17,11 @@
 ## 📊 实验结果与可视化
 
 ![FASRECAM](/FASRECAM.png)
-*图：FasreCAM在目标区域定位上的效果*
 
 ## 📁 项目结构
 
 ```text
 FasreCAM/
-├── .idea/                  # IDE配置文件（建议加入 .gitignore）
-├── __pycache__/            # Python缓存（建议加入 .gitignore）
 ├── image/                  # 实验结果图片与可视化对比图
 ├── FASRECAM.png            # 方法效果展示图
 ├── __init__.py             # 模块初始化
